@@ -18,7 +18,8 @@ class TelegramChannel extends NotificationChannel {
         this.tmuxMonitor = new TmuxMonitor();
         this.apiBaseUrl = 'https://api.telegram.org';
         this.botUsername = null; // Cache for bot username
-        
+        this.activeChatId = null; // Current active chat ID (may change on errors)
+
         this._ensureDirectories();
         this._validateConfig();
     }
@@ -109,7 +110,7 @@ class TelegramChannel extends NotificationChannel {
         // Generate session ID and Token
         const sessionId = uuidv4();
         const token = this._generateToken();
-        
+
         // Get current tmux session and conversation content
         const tmuxSession = this._getCurrentTmuxSession();
         if (tmuxSession && !notification.metadata) {
@@ -120,17 +121,16 @@ class TelegramChannel extends NotificationChannel {
                 tmuxSession: tmuxSession
             };
         }
-        
+
         // Create session record
         await this._createSession(sessionId, notification, token);
 
         // Generate Telegram message
         const messageText = this._generateTelegramMessage(notification, sessionId, token);
-        
-        // Determine recipient (chat or group)
-        const chatId = this.config.groupId || this.config.chatId;
-        const isGroupChat = !!this.config.groupId;
-        
+
+        // Determine recipient (chat or group) - use active chat ID if available
+        const chatId = this.activeChatId || this.config.groupId || this.config.chatId;
+
         // Create buttons using callback_data instead of inline query
         // This avoids the automatic @bot_name addition
         const buttons = [
@@ -140,12 +140,12 @@ class TelegramChannel extends NotificationChannel {
                     callback_data: `personal:${token}`
                 },
                 {
-                    text: '👥 Group Chat', 
+                    text: '👥 Group Chat',
                     callback_data: `group:${token}`
                 }
             ]
         ];
-        
+
         const requestData = {
             chat_id: chatId,
             text: messageText,
@@ -165,11 +165,128 @@ class TelegramChannel extends NotificationChannel {
             this.logger.info(`Telegram message sent successfully, Session: ${sessionId}`);
             return true;
         } catch (error) {
+            // Check if error is due to invalid chat ID
+            const isInvalidChatError = this._isInvalidChatError(error);
+
+            if (isInvalidChatError) {
+                this.logger.warn(`Chat ID ${chatId} is invalid, attempting recovery...`);
+
+                // Try to find and use an alternative valid chat ID
+                const newChatId = await this._recoverChatId(chatId, messageText, buttons);
+
+                if (newChatId) {
+                    this.logger.info(`Recovered to new chat ID: ${newChatId}`);
+                    return true;
+                }
+            }
+
             this.logger.error('Failed to send Telegram message:', error.response?.data || error.message);
             // Clean up failed session
             await this._removeSession(sessionId);
             return false;
         }
+    }
+
+    /**
+     * Check if error is due to invalid/blocked chat ID
+     */
+    _isInvalidChatError(error) {
+        const errorData = error.response?.data;
+        if (!errorData) return false;
+
+        const description = errorData.description || '';
+        const errorCode = errorData.error_code;
+
+        // Common Telegram errors for invalid chats
+        const invalidChatErrors = [
+            'chat not found',
+            'bot was blocked by the user',
+            'user is deactivated',
+            'bot was kicked from the group chat',
+            'bot is not a member of the group chat',
+            'chat_id is empty',
+            'CHAT_ID_INVALID'
+        ];
+
+        return errorCode === 400 || errorCode === 403 ||
+            invalidChatErrors.some(err => description.toLowerCase().includes(err.toLowerCase()));
+    }
+
+    /**
+     * Try to recover by finding a valid chat ID from whitelist
+     */
+    async _recoverChatId(failedChatId, messageText, buttons) {
+        // Get all possible chat IDs to try
+        const candidates = this._getChatIdCandidates(failedChatId);
+
+        if (candidates.length === 0) {
+            this.logger.warn('No alternative chat IDs available for recovery');
+            return null;
+        }
+
+        for (const candidateId of candidates) {
+            this.logger.debug(`Trying alternative chat ID: ${candidateId}`);
+
+            try {
+                const requestData = {
+                    chat_id: candidateId,
+                    text: messageText,
+                    parse_mode: 'Markdown',
+                    reply_markup: {
+                        inline_keyboard: buttons
+                    }
+                };
+
+                await axios.post(
+                    `${this.apiBaseUrl}/bot${this.config.botToken}/sendMessage`,
+                    requestData,
+                    this._getNetworkOptions()
+                );
+
+                // Success! Update active chat ID
+                this.activeChatId = candidateId;
+                this.logger.info(`Chat ID recovered: ${failedChatId} -> ${candidateId}`);
+
+                return candidateId;
+            } catch (candidateError) {
+                this.logger.debug(`Chat ID ${candidateId} also failed:`, candidateError.response?.data?.description || candidateError.message);
+                continue;
+            }
+        }
+
+        this.logger.error('All chat ID recovery attempts failed');
+        return null;
+    }
+
+    /**
+     * Get list of candidate chat IDs to try (excluding the failed one)
+     */
+    _getChatIdCandidates(failedChatId) {
+        const candidates = [];
+        const failedStr = String(failedChatId);
+
+        // Add from whitelist
+        const whitelist = this.config.whitelist || [];
+        for (const id of whitelist) {
+            if (String(id) !== failedStr && !candidates.includes(String(id))) {
+                candidates.push(String(id));
+            }
+        }
+
+        // Add configured chat IDs if not already tried
+        if (this.config.chatId && String(this.config.chatId) !== failedStr) {
+            if (!candidates.includes(String(this.config.chatId))) {
+                candidates.push(String(this.config.chatId));
+            }
+        }
+
+        if (this.config.groupId && String(this.config.groupId) !== failedStr) {
+            if (!candidates.includes(String(this.config.groupId))) {
+                candidates.push(String(this.config.groupId));
+            }
+        }
+
+        return candidates;
     }
 
     _generateTelegramMessage(notification, sessionId, token) {
@@ -199,9 +316,8 @@ class TelegramChannel extends NotificationChannel {
             }
         }
         
-        messageText += `💬 *To send a new command:*\n`;
-        messageText += `Reply with: \`/cmd ${token} <your command>\`\n`;
-        messageText += `Example: \`/cmd ${token} Please analyze this code\``;
+        messageText += `💬 *To send a command:*\n`;
+        messageText += `Just type your message directly or send a voice message 🎤`;
 
         return messageText;
     }

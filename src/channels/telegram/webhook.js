@@ -73,8 +73,15 @@ class TelegramWebhookHandler {
     async _handleMessage(message) {
         const chatId = message.chat.id;
         const userId = message.from.id;
+
+        // Handle voice/audio messages
+        if (message.voice || message.audio) {
+            await this._handleVoiceMessage(message, chatId, userId);
+            return;
+        }
+
         const messageText = message.text?.trim();
-        
+
         if (!messageText) return;
 
         // Check if user is authorized
@@ -96,25 +103,235 @@ class TelegramWebhookHandler {
             return;
         }
 
-        // Parse command
-        const commandMatch = messageText.match(/^\/cmd\s+([A-Z0-9]{8})\s+(.+)$/i);
-        if (!commandMatch) {
-            // Check if it's a direct command without /cmd prefix
-            const directMatch = messageText.match(/^([A-Z0-9]{8})\s+(.+)$/);
-            if (directMatch) {
-                await this._processCommand(chatId, directMatch[1], directMatch[2]);
-            } else {
-                await this._sendMessage(chatId, 
-                    '❌ Invalid format. Use:\n`/cmd <TOKEN> <command>`\n\nExample:\n`/cmd ABC12345 analyze this code`',
-                    { parse_mode: 'Markdown' });
-            }
+        // Try to parse command with different formats (most specific to least specific)
+
+        // Format 1: /cmd <TOKEN> <command>
+        const cmdTokenMatch = messageText.match(/^\/cmd\s+([A-Z0-9]{8})\s+(.+)$/is);
+        if (cmdTokenMatch) {
+            await this._processCommand(chatId, cmdTokenMatch[1].toUpperCase(), cmdTokenMatch[2]);
             return;
         }
 
-        const token = commandMatch[1].toUpperCase();
-        const command = commandMatch[2];
+        // Format 2: <TOKEN> <command> (token at start)
+        const tokenMatch = messageText.match(/^([A-Z0-9]{8})\s+(.+)$/is);
+        if (tokenMatch) {
+            await this._processCommand(chatId, tokenMatch[1].toUpperCase(), tokenMatch[2]);
+            return;
+        }
 
-        await this._processCommand(chatId, token, command);
+        // Format 3: Just the command (no token, no /cmd) - use most recent active session
+        await this._processCommandWithoutToken(chatId, userId, messageText);
+    }
+
+    async _handleVoiceMessage(message, chatId, userId) {
+        // Check if user is authorized
+        if (!this._isAuthorized(userId, chatId)) {
+            this.logger.warn(`Unauthorized user/chat: ${userId}/${chatId}`);
+            await this._sendMessage(chatId, '⚠️ You are not authorized to use this bot.');
+            return;
+        }
+
+        const voice = message.voice || message.audio;
+        const fileId = voice.file_id;
+
+        try {
+            // Notify user that we're processing the audio
+            await this._sendMessage(chatId, '🎤 Processing your voice message...');
+
+            // Get file path from Telegram
+            const fileResponse = await axios.get(
+                `${this.apiBaseUrl}/bot${this.config.botToken}/getFile?file_id=${fileId}`,
+                this._getNetworkOptions()
+            );
+
+            if (!fileResponse.data.ok) {
+                throw new Error('Failed to get file info from Telegram');
+            }
+
+            const filePath = fileResponse.data.result.file_path;
+            const fileUrl = `${this.apiBaseUrl}/file/bot${this.config.botToken}/${filePath}`;
+
+            // Download the audio file
+            const audioResponse = await axios.get(fileUrl, {
+                responseType: 'arraybuffer',
+                ...this._getNetworkOptions()
+            });
+
+            // Transcribe the audio
+            const transcribedText = await this._transcribeAudio(audioResponse.data, filePath);
+
+            if (!transcribedText || transcribedText.trim() === '') {
+                await this._sendMessage(chatId, '❌ Could not transcribe the audio. Please try again or send a text message.');
+                return;
+            }
+
+            // Notify user of the transcription
+            await this._sendMessage(chatId,
+                `📝 *Transcribed:* ${transcribedText}`,
+                { parse_mode: 'Markdown' });
+
+            // Process the transcribed text as a command (without token)
+            await this._processCommandWithoutToken(chatId, userId, transcribedText);
+
+        } catch (error) {
+            this.logger.error('Voice message processing failed:', error.message);
+            await this._sendMessage(chatId,
+                `❌ Failed to process voice message: ${error.message}`);
+        }
+    }
+
+    async _transcribeAudio(audioBuffer, filePath) {
+        // Check if OpenAI API key is configured for Whisper
+        const openaiKey = this.config.openaiApiKey || process.env.OPENAI_API_KEY;
+
+        if (openaiKey) {
+            return await this._transcribeWithWhisper(audioBuffer, filePath, openaiKey);
+        }
+
+        // Fallback: Try local whisper if available
+        return await this._transcribeWithLocalWhisper(audioBuffer, filePath);
+    }
+
+    async _transcribeWithWhisper(audioBuffer, filePath, apiKey) {
+        const FormData = require('form-data');
+        const form = new FormData();
+
+        // Determine file extension
+        const ext = path.extname(filePath) || '.ogg';
+        const filename = `audio${ext}`;
+
+        form.append('file', Buffer.from(audioBuffer), {
+            filename: filename,
+            contentType: ext === '.ogg' ? 'audio/ogg' : 'audio/mpeg'
+        });
+        form.append('model', 'whisper-1');
+
+        try {
+            const response = await axios.post(
+                'https://api.openai.com/v1/audio/transcriptions',
+                form,
+                {
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        ...form.getHeaders()
+                    },
+                    ...this._getNetworkOptions()
+                }
+            );
+
+            return response.data.text;
+        } catch (error) {
+            this.logger.error('Whisper API transcription failed:', error.response?.data || error.message);
+            throw new Error('Whisper transcription failed');
+        }
+    }
+
+    async _transcribeWithLocalWhisper(audioBuffer, filePath) {
+        const { execSync } = require('child_process');
+        const os = require('os');
+
+        // Create temp file
+        const tempDir = os.tmpdir();
+        const ext = path.extname(filePath) || '.ogg';
+        const tempFile = path.join(tempDir, `telegram_voice_${Date.now()}${ext}`);
+
+        try {
+            // Write audio buffer to temp file
+            fs.writeFileSync(tempFile, Buffer.from(audioBuffer));
+
+            // Try to run local whisper
+            const result = execSync(`whisper "${tempFile}" --model base --output_format txt --output_dir "${tempDir}"`, {
+                encoding: 'utf8',
+                timeout: 60000
+            });
+
+            // Read the transcription result
+            const txtFile = tempFile.replace(ext, '.txt');
+            if (fs.existsSync(txtFile)) {
+                const transcription = fs.readFileSync(txtFile, 'utf8').trim();
+                fs.unlinkSync(txtFile);
+                return transcription;
+            }
+
+            throw new Error('Transcription file not found');
+        } catch (error) {
+            this.logger.warn('Local whisper not available:', error.message);
+            throw new Error('No transcription service available. Please configure OPENAI_API_KEY for Whisper.');
+        } finally {
+            // Cleanup temp file
+            if (fs.existsSync(tempFile)) {
+                fs.unlinkSync(tempFile);
+            }
+        }
+    }
+
+    async _processCommandWithoutToken(chatId, userId, command) {
+        // Find the most recent active session for this user/chat
+        const session = await this._findMostRecentSession(chatId, userId);
+
+        if (!session) {
+            await this._sendMessage(chatId,
+                '❌ No active session found. Please wait for a task notification first.',
+                { parse_mode: 'Markdown' });
+            return;
+        }
+
+        // Check if session is expired
+        if (session.expiresAt < Math.floor(Date.now() / 1000)) {
+            await this._sendMessage(chatId,
+                '❌ Your session has expired. Please wait for a new task notification.',
+                { parse_mode: 'Markdown' });
+            await this._removeSession(session.id);
+            return;
+        }
+
+        try {
+            // Inject command into tmux session
+            const tmuxSession = session.tmuxSession || 'default';
+            await this.injector.injectCommand(command, tmuxSession);
+
+            // Send confirmation
+            await this._sendMessage(chatId,
+                `✅ *Command sent successfully*\n\n📝 *Command:* ${command}\n🖥️ *Session:* ${tmuxSession}\n\nClaude is now processing your request...`,
+                { parse_mode: 'Markdown' });
+
+            // Log command execution
+            this.logger.info(`Command injected (auto-session) - User: ${chatId}, Session: ${session.id}, Command: ${command}`);
+
+        } catch (error) {
+            this.logger.error('Command injection failed:', error.message);
+            await this._sendMessage(chatId,
+                `❌ *Command execution failed:* ${error.message}`,
+                { parse_mode: 'Markdown' });
+        }
+    }
+
+    async _findMostRecentSession(chatId, userId) {
+        const files = fs.readdirSync(this.sessionsDir);
+        let mostRecentSession = null;
+        let mostRecentTime = 0;
+
+        for (const file of files) {
+            if (!file.endsWith('.json')) continue;
+
+            const sessionPath = path.join(this.sessionsDir, file);
+            try {
+                const session = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+
+                // Check if session is still valid (not expired)
+                if (session.expiresAt && session.expiresAt > Math.floor(Date.now() / 1000)) {
+                    // Check if this session is more recent
+                    if (session.createdAt && session.createdAt > mostRecentTime) {
+                        mostRecentTime = session.createdAt;
+                        mostRecentSession = session;
+                    }
+                }
+            } catch (error) {
+                this.logger.error(`Failed to read session file ${file}:`, error.message);
+            }
+        }
+
+        return mostRecentSession;
     }
 
     async _processCommand(chatId, token, command) {
@@ -189,10 +406,11 @@ class TelegramWebhookHandler {
     async _sendWelcomeMessage(chatId) {
         const message = `🤖 *Welcome to Claude Code Remote Bot!*\n\n` +
             `I'll notify you when Claude completes tasks or needs input.\n\n` +
-            `When you receive a notification with a token, you can send commands back using:\n` +
-            `\`/cmd <TOKEN> <your command>\`\n\n` +
+            `*How to send commands:*\n` +
+            `• Just type your command directly!\n` +
+            `• Or send a voice message 🎤\n\n` +
             `Type /help for more information.`;
-        
+
         await this._sendMessage(chatId, message, { parse_mode: 'Markdown' });
     }
 
@@ -200,15 +418,19 @@ class TelegramWebhookHandler {
         const message = `📚 *Claude Code Remote Bot Help*\n\n` +
             `*Commands:*\n` +
             `• \`/start\` - Welcome message\n` +
-            `• \`/help\` - Show this help\n` +
-            `• \`/cmd <TOKEN> <command>\` - Send command to Claude\n\n` +
-            `*Example:*\n` +
-            `\`/cmd ABC12345 analyze the performance of this function\`\n\n` +
+            `• \`/help\` - Show this help\n\n` +
+            `*Sending commands to Claude:*\n` +
+            `• Just type your command directly\n` +
+            `• Or send a voice message 🎤\n` +
+            `• Legacy format: \`/cmd <TOKEN> <command>\`\n\n` +
+            `*Examples:*\n` +
+            `• \`analyze this code\`\n` +
+            `• \`fix the bug in the login function\`\n\n` +
             `*Tips:*\n` +
-            `• Tokens are case-insensitive\n` +
-            `• Tokens expire after 24 hours\n` +
-            `• You can also just type \`TOKEN command\` without /cmd`;
-        
+            `• Commands are sent to the most recent active session\n` +
+            `• Sessions expire after 24 hours\n` +
+            `• Voice messages are transcribed automatically`;
+
         await this._sendMessage(chatId, message, { parse_mode: 'Markdown' });
     }
 
