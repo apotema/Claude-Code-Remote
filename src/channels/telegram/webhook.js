@@ -181,15 +181,20 @@ class TelegramWebhookHandler {
     }
 
     async _transcribeAudio(audioBuffer, filePath) {
-        // Check if OpenAI API key is configured for Whisper
-        const openaiKey = this.config.openaiApiKey || process.env.OPENAI_API_KEY;
+        // Try local whisper CLI first (default)
+        try {
+            return await this._transcribeWithLocalWhisper(audioBuffer, filePath);
+        } catch (localError) {
+            this.logger.debug('Local whisper failed, trying OpenAI API:', localError.message);
 
-        if (openaiKey) {
-            return await this._transcribeWithWhisper(audioBuffer, filePath, openaiKey);
+            // Fallback to OpenAI Whisper API if local fails
+            const openaiKey = this.config.openaiApiKey || process.env.OPENAI_API_KEY;
+            if (openaiKey) {
+                return await this._transcribeWithWhisper(audioBuffer, filePath, openaiKey);
+            }
+
+            throw localError;
         }
-
-        // Fallback: Try local whisper if available
-        return await this._transcribeWithLocalWhisper(audioBuffer, filePath);
     }
 
     async _transcribeWithWhisper(audioBuffer, filePath, apiKey) {
